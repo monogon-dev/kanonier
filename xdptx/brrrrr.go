@@ -11,9 +11,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 import (
@@ -26,7 +29,10 @@ var (
 	flagTarget      = flag.String("target", "", "target IP address")
 	flagPayloadSize = flag.Int("size", 1, "payload size")
 	flagNumQueues   = flag.Int("n", 1, "number of queues")
-	flagFirstQueue  = flag.Int("first", 0, "first queue")
+	flagFirstQueue  = flag.Int("fq", 0, "first queue")
+	flagFirstCPU    = flag.Int("fc", 0, "first cpu")
+	flagZc          = flag.Bool("zc", false, "force af_xdp zero-copy (fails when not available)")
+	flagBatchMult   = flag.Int("bm", 1, "batch multiplier")
 )
 
 func init() {
@@ -39,12 +45,41 @@ func init() {
 		klog.Exit("missing required flag: -target")
 	}
 
-	xdp.DefaultSocketFlags = unix.XDP_ZEROCOPY
+	xdp.DefaultSocketFlags = 0 // unix.XDP_USE_NEED_WAKEUP
 	xdp.DefaultXdpFlags = 0
+
+	if *flagZc {
+		xdp.DefaultSocketFlags = xdp.DefaultSocketFlags | unix.XDP_ZEROCOPY
+	}
+}
+
+func taskset(cpu int) error {
+	mask := make([]byte, 128)
+	mask[cpu/8] = 1 << (cpu % 8)
+	_, _, e := syscall.RawSyscall(unix.SYS_SCHED_SETAFFINITY, uintptr(0), uintptr(len(mask)), uintptr(unsafe.Pointer(&mask[0])))
+	if e == 0 {
+		return nil
+	}
+	return e
 }
 
 // Inspired by https://github.com/asavie/xdp/blob/master/examples/sendudp/sendudp.go
 func txer(queueID int) {
+	// Pin thread to a single CPU
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cpu := *flagFirstCPU + queueID*2
+	if err := taskset(cpu); err != nil {
+		klog.Errorf("failed to pin thread to CPU: %v", err)
+	}
+	//name := "txer"
+	//if _, _, err := syscall.RawSyscall(syscall.SYS_PRCTL, syscall.PR_SET_NAME, uintptr(unsafe.Pointer(&name)), 0); err != 0 {
+	//	klog.Errorf("failed to set thread name: %v", err)
+	//}
+
+	klog.Infof("scheduling txer for q %d on c %d", queueID, cpu)
+
 	// Resolve NIC
 	link, err := netlink.LinkByName(*flagIfName)
 	if err != nil {
@@ -61,14 +96,18 @@ func txer(queueID int) {
 	}
 
 	// Create XDP socket
+	m := *flagBatchMult
 	xsk, err := xdp.NewSocket(link.Attrs().Index, queueID, &xdp.SocketOptions{
-		NumFrames:              128,
+		NumFrames:              128 * m,
 		FrameSize:              2048,
-		FillRingNumDescs:       64,
-		CompletionRingNumDescs: 64,
-		RxRingNumDescs:         64,
-		TxRingNumDescs:         64,
+		FillRingNumDescs:       64 * m,
+		CompletionRingNumDescs: 64 * m,
+		RxRingNumDescs:         64 * m,
+		TxRingNumDescs:         64 * m,
 	})
+	if err != nil {
+		klog.Exitf("failed to create XDP socket: %v", err)
+	}
 
 	if err := program.Register(queueID, xsk.FD()); err != nil {
 		klog.Exitf("failed to register XDP program: %v", err)
@@ -160,7 +199,14 @@ func txer(queueID int) {
 		panic(err)
 	}
 
-	payload := make([]byte, *flagPayloadSize)
+	// UDP packet size to payload size
+	size := *flagPayloadSize - 64
+	if size < 0 {
+		klog.Infof("payload size too small, using 64")
+		size = 0
+	}
+
+	payload := make([]byte, size)
 	for i := 0; i < len(payload); i++ {
 		payload[i] = byte(i)
 	}
@@ -199,7 +245,8 @@ func txer(queueID int) {
 				panic(err)
 			}
 			numPkts = cur.Completed - prev.Completed
-			klog.Infof("[%d] %d packets/s (%d Mb/s)\n", queueID, numPkts, (numPkts*uint64(frameLen)*8)/(1000*1000))
+			// Mbit/s on wire including Ethernet overhead and IPG
+			klog.Infof("[%d] %d packets/s (%d Mbit/s)\n", queueID, numPkts, numPkts*uint64(frameLen+20+4)*8/1000000)
 			prev = cur
 		}
 	}()
@@ -217,10 +264,12 @@ func txer(queueID int) {
 		if err != nil {
 			panic(err)
 		}
+		//xsk.Poll(0)
 	}
 }
 
 func main() {
+	debug.SetGCPercent(0)
 	klog.Infof("launching %d txers", *flagNumQueues)
 	wg := sync.WaitGroup{}
 	for i := 0; i < *flagNumQueues; i++ {
